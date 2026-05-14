@@ -1,0 +1,413 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// ── Pin ──────────────────────────────────────────
+#define RST_PIN   4
+#define SS_PIN    5
+#define SERVO_PIN 13
+
+// ── Wi-Fi Access Point ayarları ────────────────────────────
+const char* AP_SSID = "DoorSystem";
+const char* AP_PASS = "12345677";   // min 8 char 
+
+// ── İzinli kartlar (UID hex string olarak) ─────────────────
+// Kartın UID'sini öğrenmek için Serial monitörü aç, kartı okut
+struct Kart {
+  const char* uid;
+  const char* isim;
+};
+
+Kart izinliKartlar[] = {
+  {"A1B2C3D4", "user1"},
+  {"11223344", "user2"},
+  // Buraya yeni kart ekle: {"UIDHEX", "Name lastname"},
+};
+const int KART_SAYISI = sizeof(izinliKartlar) / sizeof(izinliKartlar[0]);
+
+// ── Servo ──────────────────────────────────────────
+#define SERVO_ACIK   90   
+#define SERVO_KAPALI 0    
+#define BEKLEME_MS   5000 
+
+// ── Log ─────────────────────────────────────────────
+struct LogKaydi {
+  String isim;
+  String uid;
+  String zaman;
+  bool giris; // true=giriş, false=izinsiz deneme
+};
+
+const int MAX_LOG = 100;
+LogKaydi loglar[MAX_LOG];
+int logSayisi = 0;
+bool siradaGiris = true; // giriş/çıkış sırası
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+Servo servo;
+WebServer server(80);
+
+// ── time ──────────────────────────────────────────
+String zamanDamgasi() {
+  // Access Point modunda gerçek zaman yok, uptime kullanıyoruz
+  unsigned long ms = millis();
+  unsigned long sn = ms / 1000;
+  unsigned long dk = sn / 60;
+  unsigned long sa = dk / 60;
+  sn %= 60; dk %= 60;
+  char buf[32];
+  sprintf(buf, "%02lu:%02lu:%02lu (uptime)", sa, dk, sn);
+  return String(buf);
+}
+
+// ── Log add ───────────────────────────────────────────────
+void logEkle(String isim, String uid, bool giris) {
+  if (logSayisi >= MAX_LOG) {
+    // Eski kaydı sil (kaydır)
+    for (int i = 0; i < MAX_LOG - 1; i++) loglar[i] = loglar[i+1];
+    logSayisi = MAX_LOG - 1;
+  }
+  loglar[logSayisi++] = {isim, uid, zamanDamgasi(), giris};
+}
+
+// ── Module card  ──────────────────────────────────────────
+String kartUID() {
+  String uid = "";
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+String kartIsmi(String uid) {
+  for (int i = 0; i < KART_SAYISI; i++) {
+    if (uid == String(izinliKartlar[i].uid)) {
+      return String(izinliKartlar[i].isim);
+    }
+  }
+  return "";
+}
+
+void kapiAc() {
+  servo.write(SERVO_ACIK);
+  Serial.println("Door open");
+}
+
+void kapiKapat() {
+  servo.write(SERVO_KAPALI);
+  Serial.println("Door closed");
+}
+
+// ── Web site (HTML File) ───────────────────
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Door Access System [DAS]</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&display=swap');
+  :root {
+    --bg: #0a0e1a;
+    --panel: #0f1526;
+    --border: #1e2d4a;
+    --accent: #00d4ff;
+    --accent2: #00ff9d;
+    --danger: #ff3860;
+    --text: #c8d8f0;
+    --muted: #4a6080;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Rajdhani', sans-serif;
+    min-height: 100vh;
+    padding: 0;
+  }
+ 
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+  .container { max-width: 900px; margin: 0 auto; padding: 24px 16px; position: relative; z-index: 1; }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 32px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .logo {
+    width: 48px; height: 48px;
+    border: 2px solid var(--accent);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px;
+    box-shadow: 0 0 16px rgba(0,212,255,0.3);
+  }
+  h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; }
+  h1 span { color: var(--accent); }
+  .uptime { font-family: 'Share Tech Mono', monospace; font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+  }
+  .stat-card .val {
+    font-size: 2rem;
+    font-weight: 700;
+    color: var(--accent);
+    font-family: 'Share Tech Mono', monospace;
+  }
+  .stat-card .lbl { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-top: 4px; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 20px;
+  }
+  .panel-header {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--accent2); display:inline-block; margin-right:8px; animation: blink 1.5s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); padding: 10px 20px; text-align: left; border-bottom: 1px solid var(--border); }
+  td { padding: 12px 20px; border-bottom: 1px solid rgba(30,45,74,0.5); font-size: 0.9rem; font-family: 'Share Tech Mono', monospace; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(0,212,255,0.03); }
+
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+  .badge-ok { background: rgba(0,255,157,0.15); color: var(--accent2); border: 1px solid rgba(0,255,157,0.3); }
+  .badge-err { background: rgba(255,56,96,0.15); color: var(--danger); border: 1px solid rgba(255,56,96,0.3); }
+
+  .empty { text-align:center; padding: 40px; color: var(--muted); font-size: 0.85rem; }
+
+  .refresh-btn {
+    background: transparent;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: 'Rajdhani', sans-serif;
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    transition: all 0.2s;
+  }
+  .refresh-btn:hover { background: var(--accent); color: var(--bg); }
+
+  footer { text-align:center; font-size:0.7rem; color: var(--muted); margin-top: 24px; letter-spacing:1px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="logo">🔐</div>
+    <div>
+      <h1>Kapi <span>Erisim</span> Sistemi</h1>
+      <div class="uptime" id="clock">Yukleniyor...</div>
+    </div>
+  </header>
+
+  <div class="stats">
+    <div class="stat-card">
+      <div class="val" id="total">—</div>
+      <div class="lbl">Toplam Giris</div>
+    </div>
+    <div class="stat-card">
+      <div class="val" id="allowed" style="color:var(--accent2)">—</div>
+      <div class="lbl">Yetkili</div>
+    </div>
+    <div class="stat-card">
+      <div class="val" id="denied" style="color:var(--danger)">—</div>
+      <div class="lbl">Yetkisiz</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <span><span class="dot"></span>Canli Log</span>
+      <button class="refresh-btn" onclick="fetchLog()">↻ Yenile</button>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Zaman</th>
+          <th>Kisi</th>
+          <th>Kart UID</th>
+          <th>Durum</th>
+        </tr>
+      </thead>
+      <tbody id="logBody">
+        <tr><td colspan="5" class="empty">Henuz kayit yok</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <footer>ESP32 RFID Kapi Sistemi &mdash; TUBİTAK Projesi</footer>
+</div>
+
+<script>
+  function fetchLog() {
+    fetch('/api/log')
+      .then(r => r.json())
+      .then(data => {
+        const body = document.getElementById('logBody');
+        let total=0, allowed=0, denied=0;
+        if (!data.length) {
+          body.innerHTML = '<tr><td colspan="5" class="empty">Henuz kayit yok</td></tr>';
+          return;
+        }
+        body.innerHTML = data.slice().reverse().map((d, i) => {
+          total++;
+          if(d.giris) allowed++; else denied++;
+          return `<tr>
+            <td style="color:var(--muted)">${data.length - i}</td>
+            <td>${d.zaman}</td>
+            <td style="color:var(--text);font-family:'Rajdhani',sans-serif;font-weight:600">${d.isim}</td>
+            <td style="color:var(--accent);font-size:0.8rem">${d.uid}</td>
+            <td><span class="badge ${d.giris ? 'badge-ok' : 'badge-err'}">${d.giris ? '✓ İzinli' : '✗ Reddedildi'}</span></td>
+          </tr>`;
+        }).join('');
+        document.getElementById('total').textContent = total;
+        document.getElementById('allowed').textContent = allowed;
+        document.getElementById('denied').textContent = denied;
+      })
+      .catch(() => {});
+  }
+
+  // Uptime count
+  let start = Date.now();
+  setInterval(() => {
+    let s = Math.floor((Date.now()-start)/1000);
+    let h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+    document.getElementById('clock').textContent =
+      `Sistem uptime: ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+  }, 1000);
+
+  //3 s update
+  fetchLog();
+  setInterval(fetchLog, 3000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ── Web server route ───────────────────────────────────
+void handleRoot() {
+  server.send(200, "text/html", HTML_PAGE);
+}
+
+void handleLog() {
+  DynamicJsonDocument doc(8192);
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < logSayisi; i++) {
+    JsonObject obj = arr.createNestedObject();
+    obj["isim"]  = loglar[i].isim;
+    obj["uid"]   = loglar[i].uid;
+    obj["zaman"] = loglar[i].zaman;
+    obj["giris"] = loglar[i].giris;
+  }
+  String output;
+  serializeJson(doc, output);
+  server.send(200, "application/json", output);
+}
+
+// ── Setup ──────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  SPI.begin();
+  rfid.PCD_Init();
+
+  servo.attach(SERVO_PIN);
+  kapiKapat();
+
+  // Access Point 
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP()); // genelde 192.168.4.1
+
+  server.on("/", handleRoot);
+  server.on("/api/log", handleLog);
+  server.begin();
+  Serial.println("Web server baslatildi.");
+  Serial.println("Kart okutulmasi bekleniyor...");
+}
+
+// ── Loop ───────────────────────────────────────────────────
+void loop() {
+  server.handleClient();
+
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  String uid = kartUID();
+  String isim = kartIsmi(uid);
+  Serial.print("Kart: "); Serial.println(uid);
+
+  if (isim != "") {
+    Serial.println("Yetkili: " + isim);
+    logEkle(isim, uid, true);
+    kapiAc();
+    // Web server'ı da dinlemeye devam et
+    unsigned long t = millis();
+    while (millis() - t < BEKLEME_MS) {
+      server.handleClient();
+    }
+    kapiKapat();
+  } else {
+    Serial.println("YETKISIZ kart: " + uid);
+    logEkle("Bilinmeyen", uid, false);
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
