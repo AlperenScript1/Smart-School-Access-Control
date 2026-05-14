@@ -21,7 +21,7 @@ The project emphasizes custom manufacturing. The enclosure was modeled in **Blen
 <p align="center">
   <img width="600" alt="3D Printing Process" src="https://github.com/user-attachments/assets/03edf4ed-3a41-4b13-a0ba-2c4b7c82c270" />
   <br>
-  <i>In-progress: Printing the custom-designed modular enclosure on the 3D printer.</i>
+  <i>Printing the custom-designed modular enclosure on the 3D printer.</i>
 </p>
 
 ### 📐 Final Prototype (Multiple Angles)
@@ -34,7 +34,7 @@ The following images show the integrated system, showcasing the compact fit of t
 </p>
 
 ## 📊 Findings & Results
-*   **100% Recognition Rate:** All authorized RFID tags were successfully identified.
+*   **?% Recognition Rate:** All authorized RFID tags were successfully identified.
 *   **Real-time Logging:** Every entry attempt is logged to the web dashboard instantly.
 *   **Efficiency:** The mechanical response time is under 0.5 seconds.
 
